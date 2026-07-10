@@ -1,0 +1,11 @@
+numpy
+pandas==2.2.3
+scipy
+matplotlib
+seaborn
+wfdb==4.1.2
+scikit-learn
+PyQt5
+jupyter
+nbconvert
+ipykernel
