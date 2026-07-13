@@ -1,25 +1,31 @@
-# Ignorar base de datos local y cache
-data/
-ptb-xl-a-large-publicly-available-electrocardiography-dataset-1.0.3/
-.venv/
-.DS_Store
-__pycache__/
-.ipynb_checkpoints/
-*.pyc
+# Ignorar base de datos local, descargas y archivos procesados gigantes
+# Ignorar el contenido de la carpeta de datos
+data/*
+data/raw/*
+*.zip
+*.tar
+*.tar.gz
+*.h5
+*.hdf5
 
-# Ignorar contenido de data
-data/**
-
+# Ignorar archivos de imágenes generadas
 *.jpg
 *.jpeg
 *.png
+
+# Ignorar entornos virtuales y sistema
+.venv/
+.DS_Store
 
 # Ignorar archivos temporales de Python y Jupyter
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
 
-# Pero mantener los .gitkeep
+# Excepciones: mantener la estructura de carpetas de datos (solo los .gitkeep)
+# Excepciones: mantener solo los archivos ocultos de estructura
+!data/.gitkeep
+!data/raw/.gitkeep
 !data/
 !data/raw/
 !data/raw/.gitkeep
