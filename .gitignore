@@ -1,31 +1,23 @@
-# Ignorar base de datos local, descargas y archivos procesados gigantes
-# Ignorar el contenido de la carpeta de datos
-data/*
-data/raw/*
+# 1. Ignorar archivos masivos y comprimidos
 *.zip
 *.tar
 *.tar.gz
 *.h5
 *.hdf5
 
-# Ignorar archivos de imágenes generadas
-*.jpg
-*.jpeg
-*.png
+# 2. Ignorar TODO el contenido dentro de las carpetas de datos
+data/raw/*
+data/processed/*
 
-# Ignorar entornos virtuales y sistema
+# 3. EXCEPCIONES: Obligar a Git a ver solo los .gitkeep
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# 4. Ignorar entornos virtuales y sistema
 .venv/
 .DS_Store
 
-# Ignorar archivos temporales de Python y Jupyter
+# 5. Ignorar caché de Python y Jupyter
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
-
-# Excepciones: mantener la estructura de carpetas de datos (solo los .gitkeep)
-# Excepciones: mantener solo los archivos ocultos de estructura
-!data/.gitkeep
-!data/raw/.gitkeep
-!data/
-!data/raw/
-!data/raw/.gitkeep
