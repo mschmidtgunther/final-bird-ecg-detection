@@ -21,3 +21,8 @@ data/processed/*
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
+
+# 6. Memoria y documentación local de trabajo
+AGENT.md
+segmentacion-adaptativa.md
+consigna-anteproyecto.md
