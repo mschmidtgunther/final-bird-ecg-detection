@@ -1,0 +1,11 @@
+=== EVALUACIÓN FINAL SOBRE EL TEST SET (HOLDOUT) ===
+
+              precision    recall  f1-score   support
+
+        LBBB     0.9747    0.9279    0.9507       208
+        NORM     0.9346    0.9446    0.9396       560
+        RBBB     0.9234    0.9318    0.9276       440
+
+    accuracy                         0.9371      1208
+   macro avg     0.9443    0.9348    0.9393      1208
+weighted avg     0.9375    0.9371    0.9372      1208

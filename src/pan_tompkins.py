@@ -1,305 +1,234 @@
 """
-pan_tompkins.py
-================
-Detección de complejos QRS mediante el algoritmo de Pan-Tompkins (1985),
-adaptado como reemplazo del find_peaks usado en la versión anterior
-(features.py, celda 7).
+Pan-Tompkins multi-derivacion para deteccion de QRS en bloqueos de rama.
 
-Reemplaza la lógica de detectar_latidos_v1() del pipeline original.
+Implementa el algoritmo clasico (Pan & Tompkins, 1985) con dos ajustes
+justificados en la bibliografia del proyecto:
 
-Diferencia metodológica clave respecto de la versión anterior:
-    - Antes: find_peaks directo sobre V1 invertida (V1 tiene deflexión
-      dominante negativa), sin garantía de que funcionara en otras
-      derivaciones.
-    - Ahora: Pan-Tompkins corre sobre Lead I (deflexión R dominante
-      positiva, el supuesto clásico del algoritmo) y los índices
-      resultantes se reutilizan para V1 y V6, ya que las tres
-      derivaciones comparten la misma base temporal (mismo fs,
-      mismo registro). Esto evita tener que correr y validar la
-      detección por separado en cada derivación.
+1. Banda pasante 8-20 Hz en lugar de la clasica 5-11 Hz, siguiendo el
+   resultado empirico de Elgendi, Jonkman & De Boer (2010) sobre 48
+   registros de MIT-BIH (incluye LBBB y RBBB), que reporta el mejor
+   SNR QRS/ruido en esa banda.
+2. Deteccion en las tres derivaciones del proyecto (V1, V6, DI) con
+   consenso: un pico solo se acepta como QRS si aparece en al menos
+   2 de las 3 derivaciones dentro de una ventana de tolerancia. Esto
+   compensa que en LBBB/RBBB el QRS ensanchado puede tener una
+   morfologia poco prominente en una derivacion puntual (p. ej. V1
+   en LBBB) pero clara en otra (V6, DI).
 
-Nota de adaptación: el filtro pasa-banda 5-15 Hz y el filtro derivada
-se implementan con scipy en vez de los filtros enteros recursivos del
-paper original de 1985 (pensados para fs=200 Hz en hardware de la
-época). La lógica de las 5 etapas (pasa-banda → derivada → cuadrado →
-integración por ventana móvil → umbral adaptativo con búsqueda hacia
-atrás) es la misma y es la que corresponde documentar en el informe.
-
-Uso típico:
-    from pan_tompkins import detectar_qrs_pan_tompkins
-    picos_r = detectar_qrs_pan_tompkins(senal_lead_I, fs=100, plot=True)
+Referencias:
+- J. Pan, W. J. Tompkins, "A real-time QRS detection algorithm", 1985.
+- M. Elgendi, M. Jonkman, F. De Boer, "Frequency bands effects on QRS
+  detection", BIOSIGNALS 2010.
 """
 
 import numpy as np
-import matplotlib.pyplot as plt
-from scipy.signal import butter, filtfilt
+from scipy.signal import butter, lfilter, find_peaks
 
 
-# =============================================================================
-# ETAPA 1 — Filtro pasa-banda 5-15 Hz (realza el complejo QRS)
-# =============================================================================
+# ---------------------------------------------------------------------
+# Etapas del pipeline (cada una recibe/devuelve un array 1D)
+# ---------------------------------------------------------------------
 
-def _filtro_pasabanda_qrs(senal: np.ndarray, fs: float, orden: int = 2) -> np.ndarray:
-    """
-    Acentúa la banda de frecuencias donde se concentra la energía del QRS
-    (5-15 Hz), atenuando onda P, onda T y ruido de alta frecuencia.
-    La señal de entrada ya viene filtrada en 0.5-40 Hz (data_loader.py),
-    así que este es un segundo filtrado, más angosto, específico para
-    la detección.
-    """
-    nyquist = fs / 2.0
-    low = 5.0 / nyquist
-    high = min(15.0 / nyquist, 0.99)  # por si fs es baja (ej. fs=100 -> nyq=50)
-    b, a = butter(orden, [low, high], btype='band')
-    return filtfilt(b, a, senal)
+def bandpass_filter(sig, fs, low=8.0, high=20.0, order=2):
+    """Filtro Butterworth pasabanda. Banda por defecto 8-20 Hz (Elgendi et al.)."""
+    nyq = fs / 2.0
+    b, a = butter(order, [low / nyq, high / nyq], btype="band")
+    return lfilter(b, a, sig)
 
 
-# =============================================================================
-# ETAPA 2 — Filtro derivada (resalta la pendiente pronunciada del QRS)
-# =============================================================================
-
-def _filtro_derivada(senal: np.ndarray, fs: float) -> np.ndarray:
-    """
-    Derivada de 5 puntos, la misma usada en el paper original:
-        y[n] = (1/8T) * (-x[n-2] - 2x[n-1] + 2x[n+1] + x[n+2])
-    Aproxima la pendiente de la señal, que es máxima durante el QRS.
-    """
+def derivative_filter(sig, fs):
+    """Derivada de 5 puntos de Pan-Tompkins: resalta la pendiente del QRS."""
     T = 1.0 / fs
-    kernel = np.array([-1, -2, 0, 2, 1]) / (8 * T)
-    return np.convolve(senal, kernel, mode='same')
+    b = np.array([1, 2, 0, -2, -1]) * (1.0 / (8.0 * T))
+    return lfilter(b, [1.0], sig)
 
 
-# =============================================================================
-# ETAPA 3 — Elevación al cuadrado (vuelve todo positivo, enfatiza picos altos)
-# =============================================================================
-
-def _elevar_al_cuadrado(senal: np.ndarray) -> np.ndarray:
-    return senal ** 2
+def squaring(sig):
+    """Vuelve todo positivo y amplifica las frecuencias altas del QRS."""
+    return sig ** 2
 
 
-# =============================================================================
-# ETAPA 4 — Integración por ventana móvil (suaviza y da un "bulto" por latido)
-# =============================================================================
+def moving_window_integration(sig, fs, window_ms=150):
+    """Integra energia en una ventana ~ ancho de QRS (150 ms por defecto)."""
+    n = max(1, int(round(fs * window_ms / 1000.0)))
+    b = np.ones(n) / n
+    return lfilter(b, [1.0], sig)
 
-def _integracion_ventana_movil(senal: np.ndarray, fs: float, ancho_ms: float = 150.0) -> np.ndarray:
+
+# ---------------------------------------------------------------------
+# Deteccion de picos con umbral adaptativo (SPKI/NPKI) por derivacion
+# ---------------------------------------------------------------------
+
+def _adaptive_threshold_peaks(integrated, fs, refractory_ms=200):
+    """Umbral adaptativo dual de Pan-Tompkins sobre la senal integrada.
+
+    Mantiene un nivel de pico de senal (SPKI) y de ruido (NPKI) que se
+    actualizan latido a latido, con un umbral de respaldo mas laxo
+    para no perder QRS ensanchados/atipicos de LBBB o RBBB.
     """
-    Promedio móvil de ancho ~150 ms (recomendado en el paper original,
-    aproxima la duración típica de un QRS). Cada muestra del resultado
-    es el promedio de las N muestras previas, generando una "joroba"
-    por cada latido que facilita la detección de picos.
-    """
-    n_muestras = max(1, int((ancho_ms / 1000.0) * fs))
-    kernel = np.ones(n_muestras) / n_muestras
-    return np.convolve(senal, kernel, mode='same')
-
-
-# =============================================================================
-# ETAPA 5 — Umbral adaptativo con búsqueda hacia atrás (search-back)
-# =============================================================================
-
-def _detectar_picos_integrada(senal_integrada: np.ndarray, fs: float) -> np.ndarray:
-    """
-    Detecta picos candidatos en la señal integrada usando el esquema de
-    doble umbral adaptativo (SPKI/NPKI) de Pan-Tompkins, con período
-    refractario y búsqueda hacia atrás (search-back) para latidos
-    perdidos por umbral demasiado alto.
-
-    Devuelve los índices (en la señal integrada) donde se ubica cada
-    "joroba" QRS candidata. La corrección al pico R real sobre la señal
-    original se hace después, en detectar_qrs_pan_tompkins().
-    """
-    # 250 ms en vez de los 200 ms clásicos del paper: en QRS anchos con
-    # patrón rSR' (IRBBB/CRBBB) el pico R y el R' pueden generar dos máximos
-    # separados en la señal integrada por un poco más de 200 ms una vez que
-    # se les aplica el suavizado de la ventana móvil. 250 ms sigue siendo
-    # seguro para no fusionar dos latidos reales distintos: incluso a 200
-    # lpm (taquicardia extrema, poco esperable en reposo) el RR mínimo es
-    # de 300 ms.
-    refractario = int(0.25 * fs)
-
-    # Inicialización de umbrales con los primeros 2 segundos de señal
-    ventana_init = senal_integrada[: min(len(senal_integrada), int(2 * fs))]
-    if len(ventana_init) == 0 or np.max(ventana_init) == 0:
+    refractory = max(1, int(round(fs * refractory_ms / 1000.0)))
+    candidate_peaks, _ = find_peaks(integrated, distance=refractory)
+    if len(candidate_peaks) == 0:
         return np.array([], dtype=int)
 
-    SPKI = float(np.max(ventana_init)) * 0.25   # estimador de pico de señal
-    NPKI = float(np.mean(ventana_init)) * 0.5   # estimador de pico de ruido
-    umbral1 = NPKI + 0.25 * (SPKI - NPKI)
-    umbral2 = 0.5 * umbral1
+    init_n = min(len(integrated), int(2 * fs))
+    spki = float(np.max(integrated[:init_n])) * 0.25 if init_n > 0 else 0.0
+    npki = float(np.mean(integrated[:init_n])) * 0.5 if init_n > 0 else 0.0
 
-    picos = []
-    rr_promedio = None
-    ultimo_pico = None
-    ya_busque_atras = False  # evita disparar search-back repetidas veces
-                              # sobre el mismo tramo (esto generaba
-                              # detecciones duplicadas en QRS anchos/con muesca)
+    accepted = []
+    rr_hist = []
 
-    i = 1
-    n = len(senal_integrada)
-    while i < n - 1:
-        # Buscar un máximo local
-        if senal_integrada[i] > senal_integrada[i - 1] and senal_integrada[i] >= senal_integrada[i + 1]:
-            if senal_integrada[i] > umbral1:
-                # Respetar período refractario
-                if ultimo_pico is None or (i - ultimo_pico) > refractario:
-                    picos.append(i)
-                    SPKI = 0.125 * senal_integrada[i] + 0.875 * SPKI
+    for p in candidate_peaks:
+        val = integrated[p]
+        thr1 = npki + 0.25 * (spki - npki)
+        thr2 = 0.5 * thr1
 
-                    if ultimo_pico is not None:
-                        rr = i - ultimo_pico
-                        rr_promedio = rr if rr_promedio is None else 0.8 * rr_promedio + 0.2 * rr
-                    ultimo_pico = i
-                    ya_busque_atras = False
-                    i += refractario  # saltar el período refractario
-                    umbral1 = NPKI + 0.25 * (SPKI - NPKI)
-                    umbral2 = 0.5 * umbral1
-                    continue
-            else:
-                NPKI = 0.125 * senal_integrada[i] + 0.875 * NPKI
-                umbral1 = NPKI + 0.25 * (SPKI - NPKI)
-                umbral2 = 0.5 * umbral1
+        is_qrs = val > thr1
+        if not is_qrs and val > thr2 and accepted:
+            avg_rr = np.mean(rr_hist[-8:]) if rr_hist else None
+            if avg_rr is not None and (p - accepted[-1]) > 1.66 * avg_rr:
+                is_qrs = True  # posible latido perdido -> umbral de respaldo
 
-            # Búsqueda hacia atrás (search-back): si pasó más de 1.66x el RR
-            # promedio sin detectar nada, es probable que haya un latido
-            # "escondido" entre umbral2 y umbral1 -> lo buscamos, pero SOLO
-            # una vez por tramo (si no, cualquier micro-máximo de ruido en la
-            # subida hacia el próximo QRS real dispara una detección extra
-            # antes de llegar al pico verdadero).
-            if rr_promedio is not None and ultimo_pico is not None and not ya_busque_atras:
-                if (i - ultimo_pico) > int(1.66 * rr_promedio):
-                    ya_busque_atras = True
-                    inicio_busq = ultimo_pico + refractario
-                    fin_busq = i
-                    if fin_busq > inicio_busq:
-                        segmento = senal_integrada[inicio_busq:fin_busq]
-                        if len(segmento) > 0:
-                            idx_local = int(np.argmax(segmento))
-                            if segmento[idx_local] > umbral2:
-                                idx_global = inicio_busq + idx_local
-                                picos.append(idx_global)
-                                SPKI = 0.25 * segmento[idx_local] + 0.75 * SPKI
-                                rr = idx_global - ultimo_pico
-                                rr_promedio = 0.8 * rr_promedio + 0.2 * rr
-                                ultimo_pico = idx_global
-        i += 1
+        if is_qrs:
+            spki = 0.125 * val + 0.875 * spki
+            if accepted:
+                rr_hist.append(p - accepted[-1])
+            accepted.append(p)
+        else:
+            npki = 0.125 * val + 0.875 * npki
 
-    picos = np.array(sorted(set(picos)), dtype=int)
-
-    # Red de seguridad: si por algún motivo quedaron dos detecciones a menos
-    # del período refractario (p.ej. un QRS con muesca muy profunda produjo
-    # dos jorobas separadas en la señal integrada), nos quedamos con la de
-    # mayor amplitud y descartamos la otra.
-    if len(picos) > 1:
-        filtrados = [picos[0]]
-        for punto in picos[1:]:
-            if punto - filtrados[-1] <= refractario:
-                if senal_integrada[punto] > senal_integrada[filtrados[-1]]:
-                    filtrados[-1] = punto
-            else:
-                filtrados.append(punto)
-        picos = np.array(filtrados, dtype=int)
-
-    return picos
+    return np.array(accepted, dtype=int)
 
 
-# =============================================================================
-# FUNCIÓN PRINCIPAL — orquesta las 5 etapas
-# =============================================================================
+def _refine_peak_locations(peaks, filtered_signal, fs, window_ms, search_fwd_ms=40):
+    """Corrige el retardo de grupo de la integracion/filtrado.
 
-def detectar_qrs_pan_tompkins(
-    senal: np.ndarray,
-    fs: float,
-    plot: bool = False,
-    ventana_correccion_ms: float = 100.0,
-    titulo: str = "",
-) -> np.ndarray:
+    La integracion de ventana movil (y los filtros previos) desplazan el
+    pico detectado hacia adelante respecto del R real. Se busca el maximo
+    absoluto de la senal ya filtrada (pasabanda) en una ventana que
+    retrocede aproximadamente el ancho de la integracion, evitando asi
+    reportar el R-peak sistematicamente tarde.
     """
-    Detecta los picos R de una señal ECG mediante el algoritmo de
-    Pan-Tompkins (pasa-banda -> derivada -> cuadrado -> integración
-    -> umbral adaptativo con búsqueda hacia atrás).
+    back = int(round(fs * window_ms / 1000.0))
+    fwd = int(round(fs * search_fwd_ms / 1000.0))
+    refined = []
+    n = len(filtered_signal)
+    for p in peaks:
+        lo = max(0, p - back)
+        hi = min(n, p + fwd)
+        if hi <= lo:
+            refined.append(p)
+            continue
+        segment = filtered_signal[lo:hi]
+        refined.append(lo + int(np.argmax(np.abs(segment))))
+    return np.array(refined, dtype=int)
 
-    Parámetros
+
+def rescue_low_amplitude_qrs(peaks, filtered_signal, fs, refractory_ms=200, thr3_factor=1.5):
+    """Recupera latidos de baja amplitud omitidos por el umbral principal.
+
+    Basado en el paso 12 (umbral THR3) de Elgendi, Jonkman & De Boer,
+    "Improved QRS detection algorithm using dynamic thresholds" (2009):
+    si un intervalo RR supera 1.5x el RR modal del registro, es probable
+    que se haya perdido un latido de baja amplitud dentro de ese hueco
+    (en vez de una pausa real). Se busca ahi el maximo local remanente
+    de la senal filtrada, respetando el periodo refractario.
+    """
+    peaks = np.sort(np.asarray(peaks, dtype=int))
+    if len(peaks) < 3:
+        return peaks
+
+    rr = np.diff(peaks)
+    vals, counts = np.unique(np.round(rr / 10.0) * 10, return_counts=True)
+    rr_mode = float(vals[np.argmax(counts)])
+    thr3 = thr3_factor * rr_mode
+    refractory = int(round(fs * refractory_ms / 1000.0))
+
+    rescued = list(peaks)
+    for i in range(len(rr)):
+        if rr[i] <= thr3:
+            continue
+        lo = peaks[i] + refractory
+        hi = peaks[i + 1] - refractory
+        if hi <= lo:
+            continue
+        segment = np.abs(filtered_signal[lo:hi])
+        if segment.size and segment.max() > 0:
+            rescued.append(lo + int(np.argmax(segment)))
+
+    return np.array(sorted(rescued), dtype=int)
+
+
+def pan_tompkins_single_lead(sig, fs, band=(8.0, 20.0), window_ms=150, refractory_ms=200,
+                              rescue_low_amplitude=True, thr3_factor=1.5):
+    """Pipeline completo de Pan-Tompkins sobre una sola derivacion.
+
+    Devuelve los indices de muestra de los R-peaks detectados, corregidos
+    por el retardo de grupo de la integracion y, opcionalmente, con
+    rescate de latidos de baja amplitud (Elgendi et al., 2009).
+    """
+    filtered = bandpass_filter(sig, fs, *band)
+    deriv = derivative_filter(filtered, fs)
+    sq = squaring(deriv)
+    integrated = moving_window_integration(sq, fs, window_ms)
+    raw_peaks = _adaptive_threshold_peaks(integrated, fs, refractory_ms)
+    peaks = _refine_peak_locations(raw_peaks, filtered, fs, window_ms)
+    if rescue_low_amplitude:
+        peaks = rescue_low_amplitude_qrs(peaks, filtered, fs, refractory_ms, thr3_factor)
+    return peaks
+
+
+# ---------------------------------------------------------------------
+# Consenso multi-derivacion (V1, V6, DI)
+# ---------------------------------------------------------------------
+
+def detect_qrs_multilead(leads, fs, band=(8.0, 20.0), tolerance_ms=80, min_leads=2):
+    """Detecta QRS combinando V1, V6 y DI (o el subconjunto que se pase).
+
+    Parameters
     ----------
-    senal : np.ndarray
-        Señal ECG ya filtrada (0.5-40 Hz), típicamente Lead I por su
-        deflexión R dominante positiva.
+    leads : dict[str, np.ndarray]
+        p. ej. {"V1": senal_v1, "V6": senal_v6, "DI": senal_di}, todas
+        alineadas muestra a muestra y a la misma fs.
     fs : float
         Frecuencia de muestreo (Hz).
-    plot : bool
-        Si True, grafica las etapas intermedias y los picos finales.
-    ventana_correccion_ms : float
-        Ventana de búsqueda alrededor de cada pico detectado en la señal
-        integrada, para corregir el retardo de fase introducido por la
-        derivada y la integración y ubicar el pico R real sobre la señal
-        original.
-    titulo : str
-        Texto identificador para el gráfico (ej. nombre del paciente).
+    tolerance_ms : float
+        Ventana para considerar que dos picos de derivaciones distintas
+        corresponden al mismo latido.
+    min_leads : int
+        Minimo de derivaciones en las que debe aparecer un pico para
+        aceptarlo como QRS de consenso (por defecto 2 de 3).
 
     Returns
     -------
-    np.ndarray con los índices (en la señal original) de cada pico R detectado.
+    consensus_peaks : np.ndarray
+        Indices de muestra de los R-peaks aceptados por consenso.
+    per_lead_peaks : dict[str, np.ndarray]
+        Picos crudos detectados en cada derivacion (util para
+        validacion visual, tal como pide el objetivo 2 del anteproyecto).
     """
-    pasabanda = _filtro_pasabanda_qrs(senal, fs)
-    derivada = _filtro_derivada(pasabanda, fs)
-    cuadrado = _elevar_al_cuadrado(derivada)
-    integrada = _integracion_ventana_movil(cuadrado, fs)
+    tol = max(1, int(round(fs * tolerance_ms / 1000.0)))
+    per_lead_peaks = {
+        name: pan_tompkins_single_lead(sig, fs, band=band)
+        for name, sig in leads.items()
+    }
 
-    picos_integrada = _detectar_picos_integrada(integrada, fs)
+    pooled = sorted(
+        (int(p), name) for name, peaks in per_lead_peaks.items() for p in peaks
+    )
 
-    # Corrección: buscar el verdadero pico R en la señal pasabanda original,
-    # dentro de una ventana alrededor de cada detección de la señal integrada,
-    # porque la derivada + integración introducen un corrimiento de fase.
-    media_ventana = int((ventana_correccion_ms / 1000.0) * fs)
-    picos_r = []
-    for idx in picos_integrada:
-        inicio = max(0, idx - media_ventana)
-        fin = min(len(pasabanda), idx + media_ventana)
-        seg = pasabanda[inicio:fin]
-        if len(seg) == 0:
-            continue
-        idx_local = int(np.argmax(np.abs(seg)))
-        picos_r.append(inicio + idx_local)
+    clusters = []
+    for p, name in pooled:
+        if clusters and p - clusters[-1]["center"] <= tol:
+            clusters[-1]["points"].append(p)
+            clusters[-1]["leads"].add(name)
+            clusters[-1]["center"] = int(np.mean(clusters[-1]["points"]))
+        else:
+            clusters.append({"points": [p], "leads": {name}, "center": p})
 
-    picos_r = np.array(sorted(set(picos_r)), dtype=int)
+    consensus_peaks = np.array(
+        [c["center"] for c in clusters if len(c["leads"]) >= min_leads], dtype=int
+    )
+    return consensus_peaks, per_lead_peaks
 
-    # Segundo filtro de fusión, ahora sobre la señal original (no la
-    # integrada): un QRS ancho con patrón rSR' (IRBBB/CRBBB/CLBBB) puede
-    # generar dos "jorobas" en la señal integrada que sobreviven al primer
-    # refractario. Acá fusionamos cualquier par de detecciones a menos de
-    # 120 ms (separación intra-QRS típica, incluso en bloqueos completos)
-    # y nos quedamos con la de mayor amplitud absoluta real -- que es la
-    # mejor aproximación al pico R verdadero. 120 ms es seguro frente a
-    # taquicardias de reposo (RR mínimo esperable ~300-400 ms).
-    dist_fusion = int(0.18 * fs)
-    if len(picos_r) > 1:
-        fusionados = [picos_r[0]]
-        for punto in picos_r[1:]:
-            if punto - fusionados[-1] <= dist_fusion:
-                if abs(pasabanda[punto]) > abs(pasabanda[fusionados[-1]]):
-                    fusionados[-1] = punto
-            else:
-                fusionados.append(punto)
-        picos_r = np.array(fusionados, dtype=int)
 
-    if plot:
-        tiempo = np.arange(len(senal)) / fs
-        fig, axs = plt.subplots(4, 1, figsize=(14, 10), sharex=True)
-        axs[0].plot(tiempo, senal, color='#2c3e50')
-        axs[0].set_title(f'Señal original — {titulo}', fontweight='bold')
-        axs[1].plot(tiempo, pasabanda, color='#2980b9')
-        axs[1].set_title('Pasa-banda 5-15 Hz')
-        axs[2].plot(tiempo, integrada, color='#27ae60')
-        axs[2].set_title('Señal integrada (ventana móvil 150 ms)')
-        axs[3].plot(tiempo, senal, color='#2c3e50', label='Señal original')
-        if len(picos_r) > 0:
-            axs[3].plot(tiempo[picos_r], senal[picos_r], "kx",
-                        markersize=12, markeredgewidth=3, label='Picos R (Pan-Tompkins)')
-        axs[3].set_title('Detección final')
-        axs[3].set_xlabel('Tiempo (s)')
-        axs[3].legend()
-        for ax in axs:
-            ax.grid(True, linestyle=':', alpha=0.6)
-        plt.tight_layout()
-        plt.show()
-
-    return picos_r

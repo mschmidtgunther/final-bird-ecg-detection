@@ -26,3 +26,10 @@ __pycache__/
 AGENT.md
 segmentacion-adaptativa.md
 consigna-anteproyecto.md
+
+
+# Artefactos obsoletos que puede regenerar sin querer el notebook Prueba.ipynb
+# si alguna celda congelada se reactiva por error.
+notebooks/*.h5
+notebooks/trainval.csv
+notebooks/test_holdout.csv
