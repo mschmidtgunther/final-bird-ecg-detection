@@ -52,7 +52,43 @@ final-bird-ecg-detection/
 │   ├── train_rf.py                 # Etapa 5: baseline Random Forest
 │   ├── train_mlp.py                # Etapa 6: baseline MLP
 │   ├── tune_rf.py                  # Etapa 7: tuning conservador de Random Forest (GridSearchCV)
-│   └── evaluate_test.py            # Etapa 8: evaluación final sobre el holdout
+│   ├── evaluate_test.py            # Etapa 8: evaluación final sobre el holdout
+│   └── data_loader.py              # Carga de registro únicos para la aplicación del pipeline de forma individual
 ├── main.py                         # Orquestador: corre las 8 etapas del pipeline en orden
 ├── requirements.txt
 └── README.md
+
+
+
+##  Interfaz Gráfica (GUI)
+
+El proyecto incluye una aplicación de escritorio intuitiva construida con **PyQt5** y **Matplotlib** para la inspección clínica, inferencia por lotes y auditoría del modelo.
+
+### Cómo ejecutarla
+
+1. **Asegurate de tener el modelo entrenado** en la carpeta `models/`. Si no existe, generalo desde la terminal con:
+   ```bash
+   python main.py --only 7
+   ```
+2. **Inicia la interfaz** desde la raíz del repositorio:
+   ```bash
+   python gui.py
+   ```
+
+---
+
+### Guía rápida de las pestañas disponibles
+
+* **1️- Registro individual:**
+  * **Carga flexible:** Lee archivos crudos WFDB (`.hea`), preprocesados (`.npy`) o busca directamente por ID del catálogo (ej. `JS39226`).
+  * **Diagnóstico visual:** Muestra la clase predicha (**NORM** 🟢, **LBBB** 🔴, **RBBB** 🔵) y su nivel de confianza, verificando el acierto si el registro dispone de etiqueta real.
+  * **Análisis de señal:** Grafica la derivación **V1** con sombreado adaptativo sobre los complejos QRS detectados y permite inspeccionar una tabla colapsable con las 51 features extraídas.
+
+* **2️- Análisis por lote:**
+  * **Inferencia masiva:** Procesa directorios enteros de archivos `.hea` o listas de IDs cargadas mediante un archivo CSV.
+  * **Monitoreo y exportación:** Cuenta con barra de progreso en tiempo real, tabla de resultados exportable directamente a `.csv` e histograma con la distribución de diagnósticos del lote.
+
+* **3️- Evaluar algoritmo:**
+  * **Auditoría rápida:** Carga un set de features con etiquetas verdaderas (ej. `features_test.csv`) para medir el rendimiento del modelo en segundos.
+  * **Métricas completas:** Despliega el reporte de clasificación de scikit-learn (Precision, Recall, F1-Score), el área **AUC-ROC (macro)** y grafica la **matriz de confusión**.
+
